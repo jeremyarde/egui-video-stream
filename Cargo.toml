@@ -1,0 +1,12 @@
+[package]
+name = "egui-video-stream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gstreamer = "0.23.4"
+gstreamer-app = "0.23.4"
+gstreamer-video = "0.23.4"
+egui = "0.30.0"
+eframe = "0.30.0"
+image = "0.24"
