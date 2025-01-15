@@ -1,0 +1,23 @@
+# Screen recording and sharing app
+
+This is a screen recording and sharing app, similar to Loom. It should be able to record the screen and share it with others (SOON).
+
+## Tech stack and preferences
+
+I prefer to use Rust for as much as possible. The frontend can be in a javascript/typescript framework like React or Svelte, dependingo on if it's easier to use or easy to integrate with the Rust screen recordings. 
+I would also like to be able to edit the video with effects or change the orientation of the camera using something like CSS to to add borders, angle of video over time, animations and more.
+
+## Features 
+
+- Record the screen
+- Share the screen (LATER)
+- Edit the video (LATER)
+- Add effects to the video (LATER)
+- Add borders, angle of video over time, animations and more (LATER)
+
+
+## questions/suggestions
+
+Please suggest technologies, libraries, frameworks, etc. that I can use to create the screen recording and editing features.
+
+

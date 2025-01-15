@@ -10,3 +10,8 @@ gstreamer-video = "0.23.4"
 egui = "0.30.0"
 eframe = "0.30.0"
 image = "0.24"
+chrono = "0.4.39"
+
+
+[profile.dev]
+opt-level=3
