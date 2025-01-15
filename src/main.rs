@@ -1,35 +1,55 @@
 use chrono;
+use core_graphics::display::{CGDisplay, CGDisplayBounds};
 use eframe::egui;
 use egui::ViewportBuilder;
+use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::Cast;
-use gstreamer::{self as gst, DeviceMonitor};
+use gstreamer::prelude::*;
+use gstreamer::DeviceMonitor;
 use gstreamer::{prelude::*, DeviceMonitorFilterId};
 use gstreamer_app;
+use gstreamer_audio;
 use std::sync::{mpsc, Arc, Mutex};
+use sysinfo::System;
 use tracing::debug;
+
+// Constants for pipeline strings
+const CAMERA_PIPELINE: &str = "avfvideosrc device-index=0 ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert ! video/x-raw,format=RGBA,width=1280,height=720 ! queue leaky=downstream max-size-buffers=1 ! appsink name=sink sync=false drop=true max-buffers=1 emit-signals=true";
+const SCREEN_PIPELINE: &str = "avfvideosrc capture-screen=true capture-screen-cursor=true device-index={} ! videoconvert ! video/x-raw,format=RGBA,framerate=30/1 ! queue leaky=downstream max-size-buffers=1 ! appsink name=sink sync=false drop=true max-buffers=1 emit-signals=true";
+const RECORDING_PIPELINE: &str = "
+    matroskamux name=mux ! filesink name=filesink sync=false
+    appsrc name=video_src format=time is-live=true ! videoconvert ! x264enc tune=zerolatency ! h264parse ! queue ! mux.
+    osxaudiosrc ! audioconvert ! audioresample ! audio/x-raw,rate=44100 ! queue ! avenc_aac ! aacparse ! queue ! mux.
+";
 
 struct ScreenCapApp {
     texture: Option<egui::TextureHandle>,
     frame_data: Arc<Mutex<Option<Vec<u8>>>>,
     dimensions: Arc<Mutex<ImageDimensions>>,
     is_recording: bool,
+    is_mic_enabled: bool,
     pipeline: gst::Pipeline,
     recording_bin: Option<gst::Element>,
-    current_device_id: String,
-    gstreamer_devices: Vec<MediaDeviceInfo>,
+    current_device_idx: Option<usize>,
+    current_mic_idx: Option<usize>,
+    audio_devices: Vec<MediaDeviceInfo>,
+    video_devices: Vec<MediaDeviceInfo>,
     show_settings: bool,
     image_size: egui::Vec2,
     update_dimensions_tx: mpsc::Sender<bool>,
+    update_audio_tx: mpsc::Sender<bool>,
+    audio_bin: Option<gst::Element>,
+    recording_files: Option<(String, String, String)>, // (video_file, audio_file, final_file)
 }
 
 #[derive(Debug)]
 struct MediaDeviceInfo {
-    id: u32,
-    device_id: String,
+    pipeline_id: u32,
     kind: MediaDeviceKind,
     label: String,
     setup_pipeline: String,
+    device_id: Option<String>, // For audio devices
 }
 
 #[derive(Debug, PartialEq)]
@@ -39,45 +59,6 @@ enum MediaDeviceKind {
     VideoInput,
 }
 
-fn get_devices() -> Result<Vec<MediaDeviceInfo>, ()> {
-    let mut devices = Vec::new();
-
-    // Always add FaceTime camera as device 0
-    devices.push(MediaDeviceInfo {
-        id: 0,
-        device_id: "0".to_string(),
-        kind: MediaDeviceKind::VideoInput,
-        label: "FaceTime Camera".to_string(),
-        setup_pipeline: CAMERA_PIPELINE.to_string(),
-    });
-
-    // Add screen capture devices on macOS
-    if cfg!(target_os = "macos") {
-        // Add main display
-        devices.push(MediaDeviceInfo {
-            id: 1,
-            device_id: "1".to_string(),
-            kind: MediaDeviceKind::VideoInput,
-            label: "Main Display".to_string(),
-            setup_pipeline: SCREEN_PIPELINE.replace("{}", "0"),
-        });
-
-        // Try to detect additional displays
-        for i in 2..4 {
-            devices.push(MediaDeviceInfo {
-                id: i,
-                device_id: i.to_string(),
-                kind: MediaDeviceKind::VideoInput,
-                label: format!("Display {}", i),
-                setup_pipeline: SCREEN_PIPELINE.replace("{}", &(i - 1).to_string()),
-            });
-        }
-    }
-
-    println!("Available devices: {:?}", devices);
-    Ok(devices)
-}
-
 impl ScreenCapApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Initialize GStreamer
@@ -85,6 +66,14 @@ impl ScreenCapApp {
             eprintln!("Failed to initialize GStreamer: {}", e);
             std::process::exit(1);
         }
+
+        // Get audio devices
+        let audio_devices = get_audio_devices();
+        let current_mic_idx = if !audio_devices.is_empty() {
+            Some(0)
+        } else {
+            None
+        };
 
         match setup_gstreamer(0) {
             Ok(GstreamerSetup {
@@ -103,17 +92,23 @@ impl ScreenCapApp {
                 }
                 let image_size = egui::Vec2::new(width as f32, height as f32);
                 Self {
-                    gstreamer_devices: devices,
+                    audio_devices,
+                    video_devices: devices,
+                    update_audio_tx: mpsc::channel().0,
                     texture: None,
                     frame_data,
                     dimensions: image_dims,
                     update_dimensions_tx: tx,
                     is_recording: false,
+                    is_mic_enabled: true,
+                    current_mic_idx,
                     pipeline,
                     recording_bin: None,
-                    current_device_id: String::new(),
+                    current_device_idx: Some(0),
                     show_settings: true,
                     image_size,
+                    audio_bin: None,
+                    recording_files: None,
                 }
             }
             Err(err) => {
@@ -125,20 +120,124 @@ impl ScreenCapApp {
                     height: 720,
                 }));
                 Self {
-                    gstreamer_devices: vec![],
+                    audio_devices,
+                    video_devices: vec![],
                     texture: None,
                     frame_data: Arc::new(Mutex::new(None)),
                     dimensions: default_dims,
                     is_recording: false,
+                    is_mic_enabled: true,
+                    current_mic_idx: None,
                     pipeline: dummy_pipeline.downcast::<gst::Pipeline>().unwrap(),
                     recording_bin: None,
-                    current_device_id: String::new(),
+                    current_device_idx: Some(0),
                     show_settings: true,
                     image_size: egui::Vec2::new(1280.0, 720.0),
                     update_dimensions_tx: mpsc::channel().0,
+                    update_audio_tx: mpsc::channel().0,
+                    audio_bin: None,
+                    recording_files: None,
                 }
             }
         }
+    }
+
+    fn start_recording(&mut self) {
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("recording_{}.mkv", timestamp);
+
+        // Create recording pipeline with selected audio device
+        let audio_pipeline = if self.is_mic_enabled {
+            // Default audio pipeline without specific device
+            "osxaudiosrc ! audioconvert ! audioresample ! audio/x-raw,rate=44100 ! queue ! avenc_aac ! aacparse ! queue ! mux.".to_string()
+        } else {
+            String::new()
+        };
+
+        // Create recording pipeline
+        let recording_pipeline = format!(
+            "appsrc name=video_src format=time is-live=true do-timestamp=true ! videoconvert ! video/x-raw,format=I420 ! x264enc tune=zerolatency ! h264parse ! queue ! mux. {} matroskamux name=mux ! filesink name=filesink sync=false location={}",
+            audio_pipeline,
+            filename
+        );
+
+        println!("Creating recording pipeline: {}", recording_pipeline);
+
+        match gst::parse::launch(&recording_pipeline) {
+            Ok(elem) => {
+                let recording_bin = elem.downcast::<gst::Pipeline>().unwrap();
+
+                // Set up video source
+                if let Some(video_src) = recording_bin.by_name("video_src") {
+                    let dims = self.dimensions.lock().unwrap();
+                    let caps = gst::Caps::builder("video/x-raw")
+                        .field("format", "RGBA")
+                        .field("width", dims.width)
+                        .field("height", dims.height)
+                        .field("framerate", gst::Fraction::new(30, 1))
+                        .build();
+                    video_src.set_property("caps", &caps);
+
+                    // Set up buffer handling
+                    let video_src = video_src
+                        .downcast::<gstreamer_app::AppSrc>()
+                        .expect("Failed to downcast to AppSrc");
+
+                    video_src.set_format(gst::Format::Time);
+                    video_src.set_max_bytes(1);
+                    video_src.set_do_timestamp(true);
+
+                    let frame_data = self.frame_data.clone();
+                    let video_src_weak = video_src.downgrade();
+                    video_src.set_callbacks(
+                        gstreamer_app::AppSrcCallbacks::builder()
+                            .need_data(move |_, _| {
+                                if let Some(video_src) = video_src_weak.upgrade() {
+                                    if let Ok(guard) = frame_data.lock() {
+                                        if let Some(buffer) = guard.as_ref() {
+                                            let mut gst_buffer =
+                                                gst::Buffer::with_size(buffer.len())
+                                                    .expect("Failed to allocate buffer");
+                                            {
+                                                let buffer_mut = gst_buffer.get_mut().unwrap();
+                                                let mut data = buffer_mut.map_writable().unwrap();
+                                                data.copy_from_slice(buffer);
+                                            }
+                                            let _ = video_src.push_buffer(gst_buffer);
+                                        }
+                                    }
+                                }
+                            })
+                            .build(),
+                    );
+                }
+
+                // Start the recording pipeline
+                if let Err(e) = recording_bin.set_state(gst::State::Playing) {
+                    eprintln!("Failed to start recording pipeline: {:?}", e);
+                    if let Some(msg) = recording_bin.bus().unwrap().timed_pop(gst::ClockTime::NONE)
+                    {
+                        eprintln!("Recording pipeline error message: {:?}", msg);
+                    }
+                } else {
+                    println!("Recording started: {}", filename);
+                    self.recording_bin = Some(recording_bin.upcast());
+                    self.is_recording = true;
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to create recording pipeline: {:?}", e);
+            }
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        if let Some(recording_bin) = self.recording_bin.take() {
+            if let Err(e) = recording_bin.set_state(gst::State::Null) {
+                eprintln!("Error stopping recording pipeline: {:?}", e);
+            }
+        }
+        self.is_recording = false;
     }
 
     pub fn get_current_frame(&self) -> Option<Vec<u8>> {
@@ -162,14 +261,14 @@ impl ScreenCapApp {
         })
     }
 
-    fn switch_source(&mut self, device_id: u32) {
+    fn switch_source(&mut self, device_idx: usize) {
         // Stop the current pipeline first
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
             eprintln!("Error stopping pipeline: {:?}", e);
         }
 
         // Start the new pipeline with error handling
-        match setup_gstreamer(device_id) {
+        match setup_gstreamer(device_idx) {
             Ok(GstreamerSetup {
                 frame_data,
                 image_dims,
@@ -180,17 +279,26 @@ impl ScreenCapApp {
                 self.frame_data = frame_data;
                 self.dimensions = image_dims;
                 self.pipeline = pipeline;
-                self.gstreamer_devices = devices;
+                self.video_devices = devices;
                 self.update_dimensions_tx = tx;
-                self.current_device_id = device_id.to_string();
+                self.current_device_idx = Some(device_idx);
 
                 // Update image size
                 let dims = self.dimensions.lock().unwrap();
                 self.image_size = egui::Vec2::new(dims.width as f32, dims.height as f32);
+                println!("Switched to device {}", device_idx);
             }
             Err(e) => {
                 eprintln!("Failed to start pipeline: {:?}", e);
             }
+        }
+    }
+
+    fn switch_mic(&mut self, idx: usize) {
+        self.current_mic_idx = Some(idx);
+        if self.is_recording {
+            self.stop_recording();
+            self.start_recording();
         }
     }
 }
@@ -224,165 +332,21 @@ impl eframe::App for ScreenCapApp {
                 let expected_size = (dims.width * dims.height * 4) as usize;
 
                 if buffer.len() == expected_size {
-                    // Create color image from RGBA buffer
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(
                         [dims.width as usize, dims.height as usize],
                         buffer,
                     );
 
-                    // Update texture with appropriate options
-                    let options = egui::TextureOptions {
-                        magnification: egui::TextureFilter::Linear,
-                        minification: egui::TextureFilter::Linear,
-                        ..Default::default()
-                    };
-
-                    // Only update texture if dimensions match
                     self.texture = Some(ctx.load_texture(
-                        format!("screen-capture-{}", self.current_device_id),
+                        format!("screen-capture-{:?}", self.current_device_idx),
                         color_image,
-                        options,
+                        egui::TextureOptions::default(),
                     ));
-                } else {
-                    println!(
-                        "Buffer size mismatch: got {}, expected {} ({}x{})",
-                        buffer.len(),
-                        expected_size,
-                        dims.width,
-                        dims.height
-                    );
                 }
             }
         }
 
-        // Top panel with gradient background
-        egui::TopBottomPanel::top("top_panel")
-            .frame(
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(30, 30, 40))
-                    .inner_margin(10.0),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("Screen Capture")
-                            .size(20.0)
-                            .strong()
-                            .color(egui::Color32::from_rgb(200, 200, 255)),
-                    ));
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Settings button with hover effect
-                        let settings_btn = ui.add(
-                            egui::Button::new(egui::RichText::new("⚙").size(20.0).color(
-                                if self.show_settings {
-                                    egui::Color32::from_rgb(130, 180, 255)
-                                } else {
-                                    egui::Color32::LIGHT_GRAY
-                                },
-                            ))
-                            .frame(false),
-                        );
-                        if settings_btn.clicked() {
-                            self.show_settings = !self.show_settings;
-                        }
-
-                        // Record button with status color
-                        let record_text = if self.is_recording { "⏹" } else { "⏺" };
-                        let record_color = if self.is_recording {
-                            egui::Color32::from_rgb(255, 100, 100)
-                        } else {
-                            egui::Color32::from_rgb(100, 255, 100)
-                        };
-
-                        let record_btn = ui.add(
-                            egui::Button::new(
-                                egui::RichText::new(record_text)
-                                    .size(20.0)
-                                    .color(record_color),
-                            )
-                            .frame(false),
-                        );
-
-                        if record_btn.clicked() {
-                            self.is_recording = !self.is_recording;
-                            if self.is_recording {
-                                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                                let filename = format!("recording_{}.mp4", timestamp);
-                                if let Some(filesink) = self.pipeline.by_name("filesink") {
-                                    filesink.set_property("location", &filename);
-                                }
-                                if let Some(tee) = self.pipeline.by_name("t") {
-                                    tee.set_property("allow-not-linked", true);
-                                }
-                            } else {
-                                if let Some(tee) = self.pipeline.by_name("t") {
-                                    tee.set_property("allow-not-linked", false);
-                                }
-                            }
-                        }
-                    });
-                });
-            });
-
-        // Right settings panel with styled background
-        egui::SidePanel::right("settings_panel")
-            .frame(
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(35, 35, 45))
-                    .inner_margin(10.0),
-            )
-            .default_width(200.0)
-            .show_animated(ctx, self.show_settings, |ui| {
-                ui.add(egui::Label::new(
-                    egui::RichText::new("Settings")
-                        .size(18.0)
-                        .strong()
-                        .color(egui::Color32::from_rgb(200, 200, 255)),
-                ));
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.label(egui::RichText::new("Source Selection").size(14.0).strong());
-                ui.add_space(4.0);
-
-                let mut selected_device = None;
-                for device in &self.gstreamer_devices {
-                    let is_selected = device.device_id == self.current_device_id;
-                    let button = ui.add(
-                        egui::Button::new(egui::RichText::new(&device.label).color(
-                            if is_selected {
-                                egui::Color32::from_rgb(130, 180, 255)
-                            } else {
-                                egui::Color32::LIGHT_GRAY
-                            },
-                        ))
-                        .fill(if is_selected {
-                            egui::Color32::from_rgb(45, 45, 60)
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        }),
-                    );
-                    if button.clicked() {
-                        selected_device = Some(device.id);
-                    }
-                }
-
-                if let Some(device_id) = selected_device {
-                    self.switch_source(device_id);
-                }
-
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-
-                ui.label(egui::RichText::new("Statistics").size(14.0).strong());
-                ui.add_space(4.0);
-                ui.label(format!("State: {:?}", self.pipeline.current_state()));
-            });
-
-        // Main video panel
+        // Main video panel as background
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(20, 20, 25)))
             .show(ctx, |ui| {
@@ -390,10 +354,9 @@ impl eframe::App for ScreenCapApp {
                     let available_size = ui.available_size();
                     let dims = self.dimensions.lock().unwrap();
                     let aspect_ratio = dims.width as f32 / dims.height as f32;
-                    drop(dims); // Release the lock
+                    drop(dims);
                     let mut size = available_size;
 
-                    // Calculate size to maintain aspect ratio
                     if available_size.x / available_size.y > aspect_ratio {
                         size.x = available_size.y * aspect_ratio;
                     } else {
@@ -419,14 +382,253 @@ impl eframe::App for ScreenCapApp {
                 }
             });
 
+        // Floating control panel
+        egui::Window::new("##control_panel")
+            .title_bar(false)
+            .fixed_pos(egui::pos2(20.0, 20.0))
+            .frame(
+                egui::Frame::window(&egui::Style::default())
+                    .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 230))
+                    .rounding(12.0)
+                    .outer_margin(0.0)
+                    .inner_margin(8.0),
+            )
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 12.0);
+                ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
+
+                // Header with controls
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("⌂")
+                            .size(18.0)
+                            .color(egui::Color32::from_rgb(200, 200, 255)),
+                    ));
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("🔔")
+                            .size(18.0)
+                            .color(egui::Color32::from_rgb(200, 200, 255)),
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("⋯")
+                                .size(18.0)
+                                .color(egui::Color32::from_rgb(200, 200, 255)),
+                        ));
+                    });
+                });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Full screen button
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("🖥 Full screen")
+                                .size(16.0)
+                                .color(egui::Color32::WHITE),
+                        )
+                        .min_size(egui::vec2(ui.available_width(), 32.0))
+                        .fill(egui::Color32::from_rgb(90, 80, 255))
+                        .rounding(8.0),
+                    )
+                    .clicked()
+                {
+                    // Handle full screen click
+                }
+
+                // Camera toggle
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("📷 FaceTime HD Camera")
+                            .size(14.0)
+                            .color(egui::Color32::LIGHT_GRAY),
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let is_on = self.current_device_idx == Some(0);
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if is_on { "On" } else { "Off" })
+                                        .size(14.0)
+                                        .color(if is_on {
+                                            egui::Color32::from_rgb(100, 255, 100)
+                                        } else {
+                                            egui::Color32::LIGHT_GRAY
+                                        }),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            if !is_on {
+                                self.switch_source(0);
+                            }
+                        }
+                    });
+                });
+
+                // Microphone toggle and selection
+
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("🎤 Microphone")
+                            .size(14.0)
+                            .color(egui::Color32::LIGHT_GRAY),
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut is_enabled = self.is_mic_enabled;
+                        ui.checkbox(&mut is_enabled, "");
+                        if is_enabled != self.is_mic_enabled {
+                            self.is_mic_enabled = is_enabled;
+                            // If we're currently recording, stop and restart with new settings
+                            if self.is_recording {
+                                self.stop_recording();
+                                self.start_recording();
+                            }
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                // Start recording button
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(if self.is_recording {
+                                "Stop recording"
+                            } else {
+                                "Start recording"
+                            })
+                            .size(16.0)
+                            .color(egui::Color32::WHITE),
+                        )
+                        .min_size(egui::vec2(ui.available_width(), 32.0))
+                        .fill(egui::Color32::from_rgb(255, 80, 80))
+                        .rounding(8.0),
+                    )
+                    .clicked()
+                {
+                    if self.is_recording {
+                        self.stop_recording();
+                    } else {
+                        self.start_recording();
+                    }
+                }
+
+                ui.add_space(8.0);
+
+                // Bottom buttons
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 0.0);
+
+                    if ui
+                        .add(
+                            egui::Button::new("✨")
+                                .frame(false)
+                                .min_size(egui::vec2(32.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        // Handle effects click
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new("🗒")
+                                .frame(false)
+                                .min_size(egui::vec2(32.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        // Handle speaker notes click
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new("🎨")
+                                .frame(false)
+                                .min_size(egui::vec2(32.0, 32.0)),
+                        )
+                        .clicked()
+                    {
+                        // Handle canvas click
+                    }
+                });
+
+                let mut selected_mic_idx = None;
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("Audio Source:")
+                            .size(14.0)
+                            .color(egui::Color32::LIGHT_GRAY),
+                    ));
+
+                    let current_label = self
+                        .current_mic_idx
+                        .and_then(|idx| self.audio_devices.get(idx))
+                        .map(|device| device.label.as_str())
+                        .unwrap_or("Default");
+                    egui::ComboBox::from_id_salt("mic_select")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for (idx, device) in self.audio_devices.iter().enumerate() {
+                                let selected = Some(idx) == self.current_mic_idx;
+                                if ui.selectable_label(selected, &device.label).clicked()
+                                    && !selected
+                                {
+                                    selected_mic_idx = Some(idx);
+                                }
+                            }
+                        });
+                });
+
+                // Add a dropdown for source selection
+                let mut selected_video_src_idx = None;
+                ui.horizontal(|ui| {
+                    ui.add(egui::Label::new(
+                        egui::RichText::new("Source:")
+                            .size(14.0)
+                            .color(egui::Color32::LIGHT_GRAY),
+                    ));
+
+                    let current_label = self
+                        .current_device_idx
+                        .and_then(|idx| self.video_devices.get(idx))
+                        .map(|device| device.label.as_str())
+                        .unwrap_or("Default");
+
+                    egui::ComboBox::from_id_salt("source_select")
+                        .selected_text(current_label)
+                        .show_ui(ui, |ui| {
+                            for (idx, device) in self.video_devices.iter().enumerate() {
+                                let selected = Some(idx) == self.current_device_idx;
+                                if ui.selectable_label(selected, &device.label).clicked()
+                                    && !selected
+                                {
+                                    selected_video_src_idx = Some(idx);
+                                }
+                            }
+                        });
+                });
+
+                // Handle source switching outside the UI closure
+                if let Some(idx) = selected_video_src_idx {
+                    self.switch_source(idx);
+                }
+                if let Some(idx) = selected_mic_idx {
+                    self.switch_mic(idx);
+                }
+            });
+
         // Request continuous repaints for smooth video
         ctx.request_repaint();
     }
 }
-
-// Constants for pipeline strings
-const CAMERA_PIPELINE: &str = "avfvideosrc device-index=0 ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert ! video/x-raw,format=RGBA,width=1280,height=720 ! queue leaky=downstream max-size-buffers=1 ! appsink name=sink sync=false drop=true max-buffers=1 emit-signals=true";
-const SCREEN_PIPELINE: &str = "avfvideosrc capture-screen=true capture-screen-cursor=true device-index={} ! videoconvert ! video/x-raw,format=RGBA,framerate=30/1 ! queue leaky=downstream max-size-buffers=1 ! appsink name=sink sync=false drop=true max-buffers=1 emit-signals=true";
 
 struct ImageDimensions {
     width: i32,
@@ -441,17 +643,48 @@ struct GstreamerSetup {
     tx: mpsc::Sender<bool>,
 }
 
-fn setup_gstreamer(device_id: u32) -> Result<GstreamerSetup, anyhow::Error> {
-    // First try to get available devices
-    let devices = get_devices().unwrap_or_else(|_| vec![]);
+fn setup_gstreamer(device_idx: usize) -> Result<GstreamerSetup, anyhow::Error> {
+    let displays = CGDisplay::active_displays().expect("Failed to get active displays");
+    println!("Found {} displays", displays.len());
 
-    // Find the selected device
-    let selected_device = devices
-        .iter()
-        .find(|d| d.id == device_id)
-        .ok_or_else(|| anyhow::anyhow!("Device not found"))?;
+    // Create devices list starting with FaceTime camera
+    let mut devices = vec![MediaDeviceInfo {
+        pipeline_id: 0,
+        kind: MediaDeviceKind::VideoInput,
+        label: "FaceTime Camera".to_string(),
+        setup_pipeline: CAMERA_PIPELINE.to_string(),
+        device_id: None,
+    }];
 
-    println!("Setting up pipeline for device: {:?}", selected_device);
+    // Add displays
+    for (i, display_id) in displays.iter().enumerate() {
+        let bounds = unsafe { CGDisplayBounds(*display_id) };
+        devices.push(MediaDeviceInfo {
+            pipeline_id: (i + 1) as u32,
+            kind: MediaDeviceKind::VideoInput,
+            label: format!(
+                "Display {} ({}x{})",
+                i + 1,
+                bounds.size.width,
+                bounds.size.height
+            ),
+            setup_pipeline: SCREEN_PIPELINE.replace("{}", &i.to_string()),
+            device_id: None,
+        });
+    }
+
+    println!("Available devices:");
+    for (i, device) in devices.iter().enumerate() {
+        println!("Device {}: {}", i, device.label);
+    }
+
+    println!("Setting up pipeline for device index: {}", device_idx);
+    if device_idx >= devices.len() {
+        return Err(anyhow::anyhow!("Invalid device index"));
+    }
+
+    let selected_device = &devices[device_idx];
+    println!("Selected device: {:?}", selected_device);
     println!("Using pipeline: {}", selected_device.setup_pipeline);
 
     let pipeline = gst::parse::launch(&selected_device.setup_pipeline)
@@ -568,13 +801,57 @@ fn setup_gstreamer(device_id: u32) -> Result<GstreamerSetup, anyhow::Error> {
     })
 }
 
-fn main() -> Result<(), eframe::Error> {
-    // Set environment variables to disable most logging
-    // std::env::set_var("G_MESSAGES_DEBUG", "none");
-    // std::env::set_var("GST_DEBUG", "none,GST_ELEMENT_FACTORY:0");
-    // std::env::set_var("GST_REGISTRY_UPDATE", "no");
-    // std::env::set_var("GST_REGISTRY_FORK", "no");
+fn get_audio_devices() -> Vec<MediaDeviceInfo> {
+    let mut devices = Vec::new();
+    let monitor = DeviceMonitor::new();
 
+    monitor.set_show_all_devices(true);
+    let _ = monitor.start();
+
+    // Get devices
+    let device_list = monitor.devices();
+    for device in device_list {
+        // Only include audio input devices (microphones)
+        if device.device_class().contains("Audio/Source") {
+            // Get the actual device ID from properties
+            // This is for audio input devices (microphones)
+            let device_id = if let Some(props) = device.properties() {
+                props
+                    .get::<String>("device.id")
+                    .ok()
+                    .or_else(|| Some(device.display_name().to_string()))
+            } else {
+                None
+            };
+
+            devices.push(MediaDeviceInfo {
+                pipeline_id: devices.len() as u32,
+                kind: MediaDeviceKind::AudioInput,
+                label: device.display_name().to_string(),
+                setup_pipeline: String::new(),
+                device_id,
+            });
+        }
+    }
+
+    monitor.stop();
+
+    // If no devices were found, add a default device
+    if devices.is_empty() {
+        devices.push(MediaDeviceInfo {
+            pipeline_id: 0,
+            kind: MediaDeviceKind::AudioInput,
+            label: "Default Microphone".to_string(),
+            setup_pipeline: String::new(),
+            device_id: None,
+        });
+    }
+
+    println!("Found {} audio input devices: {:?}", devices.len(), devices);
+    devices
+}
+
+fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default().with_inner_size([800.0, 600.0]),
         ..Default::default()
