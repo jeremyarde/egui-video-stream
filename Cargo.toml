@@ -11,6 +11,8 @@ egui = "0.30.0"
 eframe = "0.30.0"
 image = "0.24"
 chrono = "0.4.39"
+anyhow = "1.0.95"
+tracing = "0.1.41"
 
 
 [profile.dev]

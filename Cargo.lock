@@ -172,6 +172,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.95"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34ac096ce696dc2fcabef30516bb13c0a68a11d30131d3df6f04711467681b04"
+
+[[package]]
 name = "arboard"
 version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -914,6 +920,7 @@ dependencies = [
 name = "egui-video-stream"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "eframe",
  "egui",
@@ -921,6 +928,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "image 0.24.9",
+ "tracing",
 ]
 
 [[package]]

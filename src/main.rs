@@ -6,22 +6,21 @@ use gstreamer::prelude::Cast;
 use gstreamer::{self as gst, DeviceMonitor};
 use gstreamer::{prelude::*, DeviceMonitorFilterId};
 use gstreamer_app;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
+use tracing::debug;
 
 struct ScreenCapApp {
     texture: Option<egui::TextureHandle>,
-    receiver: mpsc::Receiver<Vec<u8>>,
-    sender: mpsc::Sender<Vec<u8>>,
-    width: i32,
-    height: i32,
+    frame_data: Arc<Mutex<Option<Vec<u8>>>>,
+    dimensions: Arc<Mutex<ImageDimensions>>,
     is_recording: bool,
     pipeline: gst::Pipeline,
     recording_bin: Option<gst::Element>,
-    current_frame: Option<Vec<u8>>,
     current_device_id: String,
     gstreamer_devices: Vec<MediaDeviceInfo>,
     show_settings: bool,
     image_size: egui::Vec2,
+    update_dimensions_tx: mpsc::Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -30,6 +29,7 @@ struct MediaDeviceInfo {
     device_id: String,
     kind: MediaDeviceKind,
     label: String,
+    setup_pipeline: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,49 +40,41 @@ enum MediaDeviceKind {
 }
 
 fn get_devices() -> Result<Vec<MediaDeviceInfo>, ()> {
-    const VIDEO_SOURCE: &str = "Video/Source";
-    const VIDEO_RAW: &str = "video/x-raw";
-    const VIDEO_OUTPUT: &str = "Video/Output";
+    let mut devices = Vec::new();
 
-    let device_monitor = DeviceMonitor::new();
+    // Always add FaceTime camera as device 0
+    devices.push(MediaDeviceInfo {
+        id: 0,
+        device_id: "0".to_string(),
+        kind: MediaDeviceKind::VideoInput,
+        label: "FaceTime Camera".to_string(),
+        setup_pipeline: CAMERA_PIPELINE.to_string(),
+    });
 
-    // Add video-specific filters BEFORE starting the monitor
-    device_monitor.add_filter(Some(VIDEO_SOURCE), None);
-    device_monitor.add_filter(Some(VIDEO_RAW), None);
-    device_monitor.add_filter(Some(VIDEO_OUTPUT), None);
-
-    let _ = device_monitor.start();
-
-    // Get hardware devices (like cameras)
-    let mut devices = device_monitor
-        .devices()
-        .iter()
-        .filter_map(|device| {
-            println!("Found device: {:?}", device);
-
-            let display_name = device.display_name().as_str().to_owned();
-            Some(MediaDeviceInfo {
-                id: 0,
-                device_id: display_name.clone(),
-                kind: MediaDeviceKind::VideoInput,
-                label: display_name,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    // On macOS, manually add screen capture devices
+    // Add screen capture devices on macOS
     if cfg!(target_os = "macos") {
-        for i in 1..4 {
+        // Add main display
+        devices.push(MediaDeviceInfo {
+            id: 1,
+            device_id: "1".to_string(),
+            kind: MediaDeviceKind::VideoInput,
+            label: "Main Display".to_string(),
+            setup_pipeline: SCREEN_PIPELINE.replace("{}", "0"),
+        });
+
+        // Try to detect additional displays
+        for i in 2..4 {
             devices.push(MediaDeviceInfo {
                 id: i,
                 device_id: i.to_string(),
                 kind: MediaDeviceKind::VideoInput,
-                label: format!("Screen {}", i),
+                label: format!("Display {}", i),
+                setup_pipeline: SCREEN_PIPELINE.replace("{}", &(i - 1).to_string()),
             });
         }
     }
 
-    device_monitor.stop();
+    println!("Available devices: {:?}", devices);
     Ok(devices)
 }
 
@@ -95,74 +87,77 @@ impl ScreenCapApp {
         }
 
         match setup_gstreamer(0) {
-            Ok((receiver, sender, width, height, pipeline, gstreamer_devices)) => Self {
-                gstreamer_devices,
-                texture: None,
-                receiver,
-                sender,
-                width,
-                height,
-                is_recording: false,
+            Ok(GstreamerSetup {
+                frame_data,
+                image_dims,
                 pipeline,
-                recording_bin: None,
-                current_frame: None,
-                current_device_id: String::new(),
-                show_settings: true,
-                image_size: egui::Vec2::new(width as f32, height as f32),
-            },
-            Err(e) => {
-                eprintln!("Failed to setup GStreamer pipeline: {:?}", e);
+                devices,
+                tx,
+            }) => {
+                let width;
+                let height;
+                {
+                    let dims = image_dims.lock().unwrap();
+                    width = dims.width;
+                    height = dims.height;
+                }
+                let image_size = egui::Vec2::new(width as f32, height as f32);
+                Self {
+                    gstreamer_devices: devices,
+                    texture: None,
+                    frame_data,
+                    dimensions: image_dims,
+                    update_dimensions_tx: tx,
+                    is_recording: false,
+                    pipeline,
+                    recording_bin: None,
+                    current_device_id: String::new(),
+                    show_settings: true,
+                    image_size,
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to setup GStreamer pipeline: {:?}", err);
                 // Return a default app state that shows an error message
                 let dummy_pipeline = gst::parse::launch("fakesrc ! fakesink").unwrap();
+                let default_dims = Arc::new(Mutex::new(ImageDimensions {
+                    width: 1280,
+                    height: 720,
+                }));
                 Self {
                     gstreamer_devices: vec![],
                     texture: None,
-                    receiver: mpsc::channel().1, // dummy receiver
-                    sender: mpsc::channel().0,   // dummy sender
-                    width: 1280,
-                    height: 720,
+                    frame_data: Arc::new(Mutex::new(None)),
+                    dimensions: default_dims,
                     is_recording: false,
                     pipeline: dummy_pipeline.downcast::<gst::Pipeline>().unwrap(),
                     recording_bin: None,
-                    current_frame: None,
                     current_device_id: String::new(),
                     show_settings: true,
                     image_size: egui::Vec2::new(1280.0, 720.0),
+                    update_dimensions_tx: mpsc::channel().0,
                 }
             }
         }
     }
 
-    fn create_source_pipeline(&self, device_id: String) -> String {
-        match device_id.as_str() {
-            "Camera" => {
-                "avfvideosrc device-index=0 ! video/x-raw,width=1280,height=720,framerate=30/1"
-                    .to_string()
-            }
-            _ => {
-                format!(
-                    "avfvideosrc capture-screen=true capture-screen-cursor=true device-index={} ! video/x-raw,framerate=30/1",
-                    device_id
-                )
-            }
-        }
-    }
-
-    pub fn get_current_frame(&self) -> Option<&[u8]> {
-        self.current_frame.as_deref()
+    pub fn get_current_frame(&self) -> Option<Vec<u8>> {
+        self.frame_data.lock().ok()?.as_ref().cloned()
     }
 
     pub fn get_dimensions(&self) -> (i32, i32) {
-        (self.width, self.height)
+        let dims = self.dimensions.lock().unwrap();
+        (dims.width, dims.height)
     }
 
     pub fn get_pixel(&self, x: i32, y: i32) -> Option<[u8; 4]> {
-        if x < 0 || x >= self.width || y < 0 || y >= self.height {
+        let dims = self.dimensions.lock().unwrap();
+        if x < 0 || x >= dims.width || y < 0 || y >= dims.height {
             return None;
         }
 
-        self.current_frame.as_ref().map(|frame| {
-            let idx = ((y * self.width + x) * 4) as usize;
+        self.frame_data.lock().unwrap().as_ref().map(|frame| {
+            let idx = ((y * dims.width + x) * 4) as usize;
             [frame[idx], frame[idx + 1], frame[idx + 2], frame[idx + 3]]
         })
     }
@@ -175,14 +170,23 @@ impl ScreenCapApp {
 
         // Start the new pipeline with error handling
         match setup_gstreamer(device_id) {
-            Ok((receiver, sender, width, height, pipeline, gstreamer_devices)) => {
-                self.receiver = receiver;
-                self.sender = sender;
-                self.width = width;
-                self.height = height;
+            Ok(GstreamerSetup {
+                frame_data,
+                image_dims,
+                pipeline,
+                devices,
+                tx,
+            }) => {
+                self.frame_data = frame_data;
+                self.dimensions = image_dims;
                 self.pipeline = pipeline;
-                self.gstreamer_devices = gstreamer_devices;
+                self.gstreamer_devices = devices;
+                self.update_dimensions_tx = tx;
                 self.current_device_id = device_id.to_string();
+
+                // Update image size
+                let dims = self.dimensions.lock().unwrap();
+                self.image_size = egui::Vec2::new(dims.width as f32, dims.height as f32);
             }
             Err(e) => {
                 eprintln!("Failed to start pipeline: {:?}", e);
@@ -213,22 +217,42 @@ impl eframe::App for ScreenCapApp {
         // Set dark theme with custom colors
         ctx.set_visuals(egui::Visuals::dark());
 
-        // Process frames as before
-        while let Ok(buffer) = self.receiver.try_recv() {
-            self.current_frame = Some(buffer);
-        }
+        // Process frame data and update texture
+        if let Ok(frame_guard) = self.frame_data.lock() {
+            if let Some(buffer) = frame_guard.as_ref() {
+                let dims = self.dimensions.lock().unwrap();
+                let expected_size = (dims.width * dims.height * 4) as usize;
 
-        if let Some(buffer) = &self.current_frame {
-            let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                [self.width as usize, self.height as usize],
-                buffer,
-            );
+                if buffer.len() == expected_size {
+                    // Create color image from RGBA buffer
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [dims.width as usize, dims.height as usize],
+                        buffer,
+                    );
 
-            self.texture = Some(ctx.load_texture(
-                "screen-capture",
-                color_image,
-                egui::TextureOptions::default(),
-            ));
+                    // Update texture with appropriate options
+                    let options = egui::TextureOptions {
+                        magnification: egui::TextureFilter::Linear,
+                        minification: egui::TextureFilter::Linear,
+                        ..Default::default()
+                    };
+
+                    // Only update texture if dimensions match
+                    self.texture = Some(ctx.load_texture(
+                        format!("screen-capture-{}", self.current_device_id),
+                        color_image,
+                        options,
+                    ));
+                } else {
+                    println!(
+                        "Buffer size mismatch: got {}, expected {} ({}x{})",
+                        buffer.len(),
+                        expected_size,
+                        dims.width,
+                        dims.height
+                    );
+                }
+            }
         }
 
         // Top panel with gradient background
@@ -364,9 +388,12 @@ impl eframe::App for ScreenCapApp {
             .show(ctx, |ui| {
                 if let Some(texture) = &self.texture {
                     let available_size = ui.available_size();
-                    let aspect_ratio = self.width as f32 / self.height as f32;
+                    let dims = self.dimensions.lock().unwrap();
+                    let aspect_ratio = dims.width as f32 / dims.height as f32;
+                    drop(dims); // Release the lock
                     let mut size = available_size;
 
+                    // Calculate size to maintain aspect ratio
                     if available_size.x / available_size.y > aspect_ratio {
                         size.x = available_size.y * aspect_ratio;
                     } else {
@@ -374,23 +401,12 @@ impl eframe::App for ScreenCapApp {
                     }
 
                     ui.centered_and_justified(|ui| {
-                        let response = ui.add(
+                        ui.add(
                             egui::Image::new(texture)
                                 .fit_to_exact_size(size)
                                 .sense(egui::Sense::drag())
                                 .rounding(4.0),
                         );
-
-                        if response.dragged() {
-                            let delta = response.drag_delta();
-                            if delta.x.abs() > delta.y.abs() {
-                                size.x = (size.x + delta.x).max(100.0);
-                                size.y = size.x / aspect_ratio;
-                            } else {
-                                size.y = (size.y + delta.y).max(100.0);
-                                size.x = size.y * aspect_ratio;
-                            }
-                        }
                     });
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -403,121 +419,161 @@ impl eframe::App for ScreenCapApp {
                 }
             });
 
+        // Request continuous repaints for smooth video
         ctx.request_repaint();
     }
 }
 
-const MACOS_PIPELINE_STR: &str =
-    "avfvideosrc device-index=0 ! videoconvert ! video/x-raw,format=RGBA ! appsink name=appsink";
-// const MACOS_PIPELINE_STR: &str = "avfvideosrc device-index=0 ! videoconvert ! video/x-raw,width=1280,height=720,framerate=30/1 ! tee name=t t. ! queue ! osxvideosink t. ! queue ! x264enc tune=zerolatency bitrate=2000 speed-preset=ultrafast !";
+// Constants for pipeline strings
+const CAMERA_PIPELINE: &str = "avfvideosrc device-index=0 ! video/x-raw,width=1280,height=720,framerate=30/1 ! videoconvert ! video/x-raw,format=RGBA,width=1280,height=720 ! queue leaky=downstream max-size-buffers=1 ! appsink name=sink sync=false drop=true max-buffers=1 emit-signals=true";
+const SCREEN_PIPELINE: &str = "avfvideosrc capture-screen=true capture-screen-cursor=true device-index={} ! videoconvert ! video/x-raw,format=RGBA,framerate=30/1 ! queue leaky=downstream max-size-buffers=1 ! appsink name=sink sync=false drop=true max-buffers=1 emit-signals=true";
 
-fn setup_gstreamer(
-    device_id: u32,
-) -> Result<
-    (
-        mpsc::Receiver<Vec<u8>>,
-        mpsc::Sender<Vec<u8>>,
-        i32,
-        i32,
-        gst::Pipeline,
-        Vec<MediaDeviceInfo>,
-    ),
-    gst::FlowError,
-> {
-    let source_element = match std::env::consts::OS {
-        "macos" => MACOS_PIPELINE_STR.to_string(),
-        "windows" => "d3d11screencapturesrc ! videoscale".to_string(),
-        "linux" => "ximagesrc ! videoscale".to_string(),
-        _ => return Err(gst::FlowError::Error),
-    };
+struct ImageDimensions {
+    width: i32,
+    height: i32,
+}
 
-    println!("Creating pipeline: {}", source_element);
+struct GstreamerSetup {
+    frame_data: Arc<Mutex<Option<Vec<u8>>>>,
+    image_dims: Arc<Mutex<ImageDimensions>>,
+    pipeline: gst::Pipeline,
+    devices: Vec<MediaDeviceInfo>,
+    tx: mpsc::Sender<bool>,
+}
 
-    let (sender, receiver) = mpsc::channel();
-    let cloned_sender = sender.clone();
+fn setup_gstreamer(device_id: u32) -> Result<GstreamerSetup, anyhow::Error> {
+    // First try to get available devices
+    let devices = get_devices().unwrap_or_else(|_| vec![]);
 
-    let pipeline = match gst::parse::launch(&source_element) {
-        Ok(elem) => elem
-            .downcast::<gst::Pipeline>()
-            .map_err(|_| gst::FlowError::Error)?,
-        Err(e) => {
-            eprintln!("Failed to create pipeline: {:?}", e);
-            return Err(gst::FlowError::Error);
-        }
-    };
+    // Find the selected device
+    let selected_device = devices
+        .iter()
+        .find(|d| d.id == device_id)
+        .ok_or_else(|| anyhow::anyhow!("Device not found"))?;
 
-    // First set to NULL to ensure clean state
-    if let Err(e) = pipeline.set_state(gst::State::Null) {
-        eprintln!("Failed to set pipeline to NULL: {:?}", e);
-        return Err(gst::FlowError::Error);
-    }
+    println!("Setting up pipeline for device: {:?}", selected_device);
+    println!("Using pipeline: {}", selected_device.setup_pipeline);
+
+    let pipeline = gst::parse::launch(&selected_device.setup_pipeline)
+        .map_err(|e| anyhow::anyhow!("Failed to create pipeline: {:?}", e))?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow::anyhow!("Failed to downcast to Pipeline"))?;
+
+    let frame_data = Arc::new(Mutex::new(None));
+    let frame_data_clone = frame_data.clone();
 
     let appsink = pipeline
         .by_name("sink")
-        .ok_or(gst::FlowError::Error)?
+        .ok_or(anyhow::anyhow!("Failed to find sink"))?
         .downcast::<gstreamer_app::AppSink>()
-        .map_err(|_| gst::FlowError::Error)?;
+        .map_err(|_| anyhow::anyhow!("Failed to cast to AppSink"))?;
 
+    // Configure appsink
     appsink.set_max_buffers(1);
     appsink.set_drop(true);
     appsink.set_sync(false);
 
+    let image_dims = ImageDimensions {
+        width: 0,
+        height: 0,
+    };
+
+    let image_dims_clone = Arc::new(Mutex::new(image_dims));
+    let image_dims_for_callback = image_dims_clone.clone();
+
+    // channel to ask for updated dimensions
+    let (tx, rx) = mpsc::channel::<bool>();
+    // ask for updated dimensions
+    tx.send(true).unwrap();
+
+    // Set up callbacks before starting the pipeline
     appsink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
-                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let sample = sink.pull_sample().map_err(|_| {
+                    println!("Failed to pull sample");
+                    gst::FlowError::Error
+                })?;
+
+                if rx.try_recv().is_ok() {
+                    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+                    println!("Caps: {:?}", caps);
+                    let mut dims = image_dims_for_callback.lock().unwrap();
+
+                    println!("Received message from channel");
+
+                    if let Some(s) = caps.structure(0) {
+                        dims.width = s.get::<i32>("width").unwrap_or(1280);
+                        dims.height = s.get::<i32>("height").unwrap_or(720);
+                        println!(
+                            "Updated dimensions from caps: {}x{}",
+                            dims.width, dims.height
+                        );
+                    } else {
+                        println!("No structure in caps, using default dimensions");
+                        dims.width = 1280;
+                        dims.height = 720;
+                    }
+                }
+
                 let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
-                let _ = sender.send(map.to_vec());
+
+                let mut data = frame_data_clone.lock().unwrap();
+                *data = Some(map.as_ref().to_vec());
+
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
     );
 
-    // Set to READY first
-    if let Err(e) = pipeline.set_state(gst::State::Ready) {
-        eprintln!("Failed to set pipeline to READY: {:?}", e);
-        return Err(gst::FlowError::Error);
-    }
+    println!("Pipeline callbacks set");
 
-    // Then set to PLAYING
+    // Set to PLAYING
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         eprintln!("Failed to set pipeline to PLAYING: {:?}", e);
-        // Try to get more detailed error information
         if let Some(msg) = pipeline.bus().unwrap().timed_pop(gst::ClockTime::NONE) {
             eprintln!("Pipeline error message: {:?}", msg);
         }
-        return Err(gst::FlowError::Error);
+        return Err(anyhow::anyhow!(
+            "Failed to set pipeline to PLAYING: {:?}",
+            e
+        ));
     }
 
-    // Wait for the pipeline to preroll
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    println!("Pipeline set to PLAYING");
 
-    let caps = match appsink.static_pad("sink") {
-        Some(pad) => pad.current_caps(),
-        None => {
-            eprintln!("Failed to get sink pad");
-            return Err(gst::FlowError::Error);
+    // Wait a bit for the pipeline to start
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Get the current dimensions and update if needed
+    {
+        let mut dims = image_dims_clone.lock().unwrap();
+        if dims.width == 0 || dims.height == 0 {
+            dims.width = 1280;
+            dims.height = 720;
         }
-    }
-    .ok_or(gst::FlowError::Error)?;
+        println!(
+            "Pipeline created with dimensions: {}x{}",
+            dims.width, dims.height
+        );
+    } // Lock is released here
 
-    let s = caps.structure(0).ok_or(gst::FlowError::Error)?;
-    let width = s.get::<i32>("width").map_err(|_| gst::FlowError::Error)?;
-    let height = s.get::<i32>("height").map_err(|_| gst::FlowError::Error)?;
-
-    println!("Pipeline created with dimensions: {}x{}", width, height);
-
-    let devices = get_devices().unwrap_or_else(|_| vec![]);
-    Ok((receiver, cloned_sender, width, height, pipeline, devices))
+    Ok(GstreamerSetup {
+        frame_data,
+        image_dims: image_dims_clone,
+        pipeline,
+        devices,
+        tx,
+    })
 }
 
 fn main() -> Result<(), eframe::Error> {
     // Set environment variables to disable most logging
-    std::env::set_var("G_MESSAGES_DEBUG", "none");
-    std::env::set_var("GST_DEBUG", "none,GST_ELEMENT_FACTORY:0");
-    std::env::set_var("GST_REGISTRY_UPDATE", "no");
-    std::env::set_var("GST_REGISTRY_FORK", "no");
+    // std::env::set_var("G_MESSAGES_DEBUG", "none");
+    // std::env::set_var("GST_DEBUG", "none,GST_ELEMENT_FACTORY:0");
+    // std::env::set_var("GST_REGISTRY_UPDATE", "no");
+    // std::env::set_var("GST_REGISTRY_FORK", "no");
 
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default().with_inner_size([800.0, 600.0]),
