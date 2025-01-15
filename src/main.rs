@@ -41,6 +41,7 @@ struct ScreenCapApp {
     update_audio_tx: mpsc::Sender<bool>,
     audio_bin: Option<gst::Element>,
     recording_files: Option<(String, String, String)>, // (video_file, audio_file, final_file)
+    is_fullscreen: bool,
 }
 
 #[derive(Debug)]
@@ -109,6 +110,7 @@ impl ScreenCapApp {
                     image_size,
                     audio_bin: None,
                     recording_files: None,
+                    is_fullscreen: false,
                 }
             }
             Err(err) => {
@@ -137,6 +139,7 @@ impl ScreenCapApp {
                     update_audio_tx: mpsc::channel().0,
                     audio_bin: None,
                     recording_files: None,
+                    is_fullscreen: false,
                 }
             }
         }
@@ -301,6 +304,20 @@ impl ScreenCapApp {
             self.start_recording();
         }
     }
+
+    fn current_device_label(&self) -> String {
+        self.current_device_idx
+            .and_then(|idx| self.video_devices.get(idx))
+            .map(|device| device.label.clone())
+            .unwrap_or_else(|| "FaceTime Camera".to_string())
+    }
+
+    fn current_mic_label(&self) -> String {
+        self.current_mic_idx
+            .and_then(|idx| self.audio_devices.get(idx))
+            .map(|device| device.label.clone())
+            .unwrap_or_else(|| "Default Microphone".to_string())
+    }
 }
 
 impl eframe::App for ScreenCapApp {
@@ -322,6 +339,18 @@ impl eframe::App for ScreenCapApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Add keyboard shortcuts
+        if ctx.input(|i| i.modifiers.command) {
+            if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+                // Cmd+R to start/stop recording
+                if self.is_recording {
+                    self.stop_recording();
+                } else {
+                    self.start_recording();
+                }
+            }
+        }
+
         // Set dark theme with custom colors
         ctx.set_visuals(egui::Visuals::dark());
 
@@ -382,76 +411,115 @@ impl eframe::App for ScreenCapApp {
                 }
             });
 
-        // Floating control panel
-        egui::Window::new("##control_panel")
-            .title_bar(false)
-            .fixed_pos(egui::pos2(20.0, 20.0))
-            .frame(
-                egui::Frame::window(&egui::Style::default())
-                    .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 230))
-                    .rounding(12.0)
-                    .outer_margin(0.0)
-                    .inner_margin(8.0),
-            )
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 12.0);
-                ui.spacing_mut().button_padding = egui::vec2(12.0, 8.0);
-
-                // Header with controls
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("⌂")
-                            .size(18.0)
-                            .color(egui::Color32::from_rgb(200, 200, 255)),
-                    ));
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("🔔")
-                            .size(18.0)
-                            .color(egui::Color32::from_rgb(200, 200, 255)),
-                    ));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new("⋯")
-                                .size(18.0)
-                                .color(egui::Color32::from_rgb(200, 200, 255)),
-                        ));
-                    });
+        // Settings button in the corner
+        if !self.show_settings {
+            egui::Window::new("⚙️")
+                .resizable(false)
+                .collapsible(false)
+                .title_bar(false)
+                .fixed_pos(egui::pos2(20.0, 20.0))
+                .frame(
+                    egui::Frame::window(&egui::Style::default())
+                        // .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 230))
+                        .rounding(12.0),
+                )
+                .show(ctx, |ui| {
+                    if ui.add(egui::Button::new("⚙️").frame(false)).clicked() {
+                        self.show_settings = true;
+                    }
                 });
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
+        }
 
-                // Full screen button
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new("🖥 Full screen")
-                                .size(16.0)
-                                .color(egui::Color32::WHITE),
-                        )
-                        .min_size(egui::vec2(ui.available_width(), 32.0))
-                        .fill(egui::Color32::from_rgb(90, 80, 255))
-                        .rounding(8.0),
-                    )
-                    .clicked()
-                {
-                    // Handle full screen click
-                }
-
-                // Camera toggle
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("📷 FaceTime HD Camera")
-                            .size(14.0)
-                            .color(egui::Color32::LIGHT_GRAY),
-                    ));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let is_on = self.current_device_idx == Some(0);
+        // Floating settings panel
+        if self.show_settings {
+            egui::Window::new("") // Empty title
+                .resizable(false)
+                .collapsible(false)
+                .title_bar(false)
+                .default_pos(egui::pos2(20.0, 20.0))
+                .frame(
+                    egui::Frame::window(&egui::Style::default())
+                        .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 250))
+                        .rounding(12.0)
+                        .outer_margin(0.0)
+                        .inner_margin(12.0),
+                )
+                .show(ctx, |ui| {
+                    // Add close button in the top-left corner
+                    ui.horizontal(|ui| {
                         if ui
                             .add(
+                                egui::Button::new(egui::RichText::new("⚙️").size(18.0))
+                                    .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.show_settings = false;
+                        }
+                    });
+
+                    ui.add_space(8.0);
+
+                    // Full screen button with modern style
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(if self.is_fullscreen {
+                                    "Exit Fullscreen"
+                                } else {
+                                    "Full Screen"
+                                })
+                                .size(14.0)
+                                .color(egui::Color32::WHITE),
+                            )
+                            .min_size(egui::vec2(ui.available_width(), 36.0))
+                            .fill(egui::Color32::from_rgb(60, 60, 180))
+                            .rounding(8.0),
+                        )
+                        .clicked()
+                    {
+                        self.is_fullscreen = !self.is_fullscreen;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                            self.is_fullscreen,
+                        ));
+                    }
+
+                    ui.add_space(12.0);
+
+                    // Source selection with modern style
+                    ui.label(
+                        egui::RichText::new("Video Source")
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(180, 180, 180)),
+                    );
+
+                    let mut selected_video_src_idx = None;
+                    ui.horizontal(|ui| {
+                        let current_label = self
+                            .current_device_idx
+                            .and_then(|idx| self.video_devices.get(idx))
+                            .map(|device| device.label.as_str())
+                            .unwrap_or("Default");
+
+                        egui::ComboBox::from_id_salt("source_select")
+                            .selected_text(current_label)
+                            .width(ui.available_width() - 40.0)
+                            .show_ui(ui, |ui| {
+                                for (idx, device) in self.video_devices.iter().enumerate() {
+                                    let selected = Some(idx) == self.current_device_idx;
+                                    if ui.selectable_label(selected, &device.label).clicked()
+                                        && !selected
+                                    {
+                                        selected_video_src_idx = Some(idx);
+                                    }
+                                }
+                            });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let is_on = self.current_device_idx == Some(0);
+                            ui.add(
                                 egui::Button::new(
                                     egui::RichText::new(if is_on { "On" } else { "Off" })
-                                        .size(14.0)
+                                        .size(12.0)
                                         .color(if is_on {
                                             egui::Color32::from_rgb(100, 255, 100)
                                         } else {
@@ -459,171 +527,144 @@ impl eframe::App for ScreenCapApp {
                                         }),
                                 )
                                 .frame(false),
+                            );
+                        });
+                    });
+
+                    ui.add_space(12.0);
+
+                    // Audio selection with modern style
+                    ui.label(
+                        egui::RichText::new("Audio Source")
+                            .size(13.0)
+                            .color(egui::Color32::from_rgb(180, 180, 180)),
+                    );
+
+                    let mut selected_mic_idx = None;
+                    ui.horizontal(|ui| {
+                        let current_label = self
+                            .current_mic_idx
+                            .and_then(|idx| self.audio_devices.get(idx))
+                            .map(|device| device.label.as_str())
+                            .unwrap_or("Default");
+
+                        egui::ComboBox::from_id_salt("mic_select")
+                            .selected_text(current_label)
+                            .width(ui.available_width() - 40.0)
+                            .show_ui(ui, |ui| {
+                                for (idx, device) in self.audio_devices.iter().enumerate() {
+                                    let selected = Some(idx) == self.current_mic_idx;
+                                    if ui.selectable_label(selected, &device.label).clicked()
+                                        && !selected
+                                    {
+                                        selected_mic_idx = Some(idx);
+                                    }
+                                }
+                            });
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let mut is_enabled = self.is_mic_enabled;
+                            ui.checkbox(&mut is_enabled, "");
+                            if is_enabled != self.is_mic_enabled {
+                                self.is_mic_enabled = is_enabled;
+                                if self.is_recording {
+                                    self.stop_recording();
+                                    self.start_recording();
+                                }
+                            }
+                        });
+                    });
+
+                    ui.add_space(16.0);
+
+                    // Start recording button with modern style
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(if self.is_recording {
+                                    "Stop Recording"
+                                } else {
+                                    "Start Recording"
+                                })
+                                .size(14.0)
+                                .color(egui::Color32::WHITE),
                             )
-                            .clicked()
-                        {
-                            if !is_on {
-                                self.switch_source(0);
-                            }
-                        }
-                    });
-                });
-
-                // Microphone toggle and selection
-
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("🎤 Microphone")
-                            .size(14.0)
-                            .color(egui::Color32::LIGHT_GRAY),
-                    ));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut is_enabled = self.is_mic_enabled;
-                        ui.checkbox(&mut is_enabled, "");
-                        if is_enabled != self.is_mic_enabled {
-                            self.is_mic_enabled = is_enabled;
-                            // If we're currently recording, stop and restart with new settings
-                            if self.is_recording {
-                                self.stop_recording();
-                                self.start_recording();
-                            }
-                        }
-                    });
-                });
-
-                ui.add_space(4.0);
-                ui.separator();
-                ui.add_space(4.0);
-
-                // Start recording button
-                if ui
-                    .add(
-                        egui::Button::new(
-                            egui::RichText::new(if self.is_recording {
-                                "Stop recording"
+                            .min_size(egui::vec2(ui.available_width(), 36.0))
+                            .fill(if self.is_recording {
+                                egui::Color32::from_rgb(220, 60, 60)
                             } else {
-                                "Start recording"
+                                egui::Color32::from_rgb(240, 80, 80)
                             })
-                            .size(16.0)
-                            .color(egui::Color32::WHITE),
-                        )
-                        .min_size(egui::vec2(ui.available_width(), 32.0))
-                        .fill(egui::Color32::from_rgb(255, 80, 80))
-                        .rounding(8.0),
-                    )
-                    .clicked()
-                {
-                    if self.is_recording {
-                        self.stop_recording();
-                    } else {
-                        self.start_recording();
-                    }
-                }
-
-                ui.add_space(8.0);
-
-                // Bottom buttons
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(12.0, 0.0);
-
-                    if ui
-                        .add(
-                            egui::Button::new("✨")
-                                .frame(false)
-                                .min_size(egui::vec2(32.0, 32.0)),
+                            .rounding(8.0),
                         )
                         .clicked()
                     {
-                        // Handle effects click
+                        if self.is_recording {
+                            self.stop_recording();
+                        } else {
+                            self.start_recording();
+                        }
                     }
 
-                    if ui
-                        .add(
-                            egui::Button::new("🗒")
-                                .frame(false)
-                                .min_size(egui::vec2(32.0, 32.0)),
-                        )
-                        .clicked()
-                    {
-                        // Handle speaker notes click
+                    ui.add_space(16.0);
+
+                    // Bottom buttons with tooltips - centered
+                    ui.with_layout(
+                        egui::Layout::top_down_justified(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(16.0, 0.0);
+                            ui.horizontal(|ui| {
+                                // Effects button
+                                ui.add_enabled_ui(false, |ui| {
+                                    ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("✨")
+                                                .size(20.0)
+                                                .color(egui::Color32::from_rgb(140, 140, 140)),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Video effects (coming soon)");
+                                });
+
+                                // Notes button
+                                ui.add_enabled_ui(false, |ui| {
+                                    ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("🗒")
+                                                .size(20.0)
+                                                .color(egui::Color32::from_rgb(140, 140, 140)),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Speaker notes (coming soon)");
+                                });
+
+                                // Drawing button
+                                ui.add_enabled_ui(false, |ui| {
+                                    ui.add(
+                                        egui::Button::new(
+                                            egui::RichText::new("🎨")
+                                                .size(20.0)
+                                                .color(egui::Color32::from_rgb(140, 140, 140)),
+                                        )
+                                        .frame(false),
+                                    )
+                                    .on_hover_text("Drawing tools (coming soon)");
+                                });
+                            });
+                        },
+                    );
+
+                    // Handle source switching outside the UI closure
+                    if let Some(idx) = selected_video_src_idx {
+                        self.switch_source(idx);
                     }
-
-                    if ui
-                        .add(
-                            egui::Button::new("🎨")
-                                .frame(false)
-                                .min_size(egui::vec2(32.0, 32.0)),
-                        )
-                        .clicked()
-                    {
-                        // Handle canvas click
+                    if let Some(idx) = selected_mic_idx {
+                        self.switch_mic(idx);
                     }
                 });
-
-                let mut selected_mic_idx = None;
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("Audio Source:")
-                            .size(14.0)
-                            .color(egui::Color32::LIGHT_GRAY),
-                    ));
-
-                    let current_label = self
-                        .current_mic_idx
-                        .and_then(|idx| self.audio_devices.get(idx))
-                        .map(|device| device.label.as_str())
-                        .unwrap_or("Default");
-                    egui::ComboBox::from_id_salt("mic_select")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            for (idx, device) in self.audio_devices.iter().enumerate() {
-                                let selected = Some(idx) == self.current_mic_idx;
-                                if ui.selectable_label(selected, &device.label).clicked()
-                                    && !selected
-                                {
-                                    selected_mic_idx = Some(idx);
-                                }
-                            }
-                        });
-                });
-
-                // Add a dropdown for source selection
-                let mut selected_video_src_idx = None;
-                ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(
-                        egui::RichText::new("Source:")
-                            .size(14.0)
-                            .color(egui::Color32::LIGHT_GRAY),
-                    ));
-
-                    let current_label = self
-                        .current_device_idx
-                        .and_then(|idx| self.video_devices.get(idx))
-                        .map(|device| device.label.as_str())
-                        .unwrap_or("Default");
-
-                    egui::ComboBox::from_id_salt("source_select")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            for (idx, device) in self.video_devices.iter().enumerate() {
-                                let selected = Some(idx) == self.current_device_idx;
-                                if ui.selectable_label(selected, &device.label).clicked()
-                                    && !selected
-                                {
-                                    selected_video_src_idx = Some(idx);
-                                }
-                            }
-                        });
-                });
-
-                // Handle source switching outside the UI closure
-                if let Some(idx) = selected_video_src_idx {
-                    self.switch_source(idx);
-                }
-                if let Some(idx) = selected_mic_idx {
-                    self.switch_mic(idx);
-                }
-            });
+        }
 
         // Request continuous repaints for smooth video
         ctx.request_repaint();
