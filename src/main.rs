@@ -1,6 +1,8 @@
 use chrono;
 use core_graphics::display::{CGDisplay, CGDisplayBounds};
 use eframe::egui;
+use egui::epaint::text::layout;
+use egui::FontId;
 use egui::ViewportBuilder;
 use gstreamer as gst;
 use gstreamer::glib;
@@ -22,6 +24,14 @@ const RECORDING_PIPELINE: &str = "
     appsrc name=video_src format=time is-live=true ! videoconvert ! x264enc tune=zerolatency ! h264parse ! queue ! mux.
     osxaudiosrc ! audioconvert ! audioresample ! audio/x-raw,rate=44100 ! queue ! avenc_aac ! aacparse ! queue ! mux.
 ";
+
+const GEAR_ICON: &str = "\u{f0e6}";
+const FULLSCREEN_ICON: &str = "\u{ed9b}";
+const FULLSCREEN_EXIT_ICON: &str = "\u{ed9a}";
+const RECORD_ON_ICON: &str = "\u{F059}";
+const RECORD_OFF_ICON: &str = "\u{F05A}";
+const MIC_ON_ICON: &str = "\u{EF50}";
+const MIC_OFF_ICON: &str = "\u{EF52}";
 
 struct ScreenCapApp {
     texture: Option<egui::TextureHandle>,
@@ -68,6 +78,9 @@ impl ScreenCapApp {
             std::process::exit(1);
         }
 
+        // Load custom fonts
+        add_font(&cc.egui_ctx);
+
         // Get audio devices
         let audio_devices = get_audio_devices();
         let current_mic_idx = if !audio_devices.is_empty() {
@@ -106,7 +119,7 @@ impl ScreenCapApp {
                     pipeline,
                     recording_bin: None,
                     current_device_idx: Some(0),
-                    show_settings: true,
+                    show_settings: false,
                     image_size,
                     audio_bin: None,
                     recording_files: None,
@@ -133,7 +146,7 @@ impl ScreenCapApp {
                     pipeline: dummy_pipeline.downcast::<gst::Pipeline>().unwrap(),
                     recording_bin: None,
                     current_device_idx: Some(0),
-                    show_settings: true,
+                    show_settings: false,
                     image_size: egui::Vec2::new(1280.0, 720.0),
                     update_dimensions_tx: mpsc::channel().0,
                     update_audio_tx: mpsc::channel().0,
@@ -413,20 +426,86 @@ impl eframe::App for ScreenCapApp {
 
         // Settings button in the corner
         if !self.show_settings {
-            egui::Window::new("⚙️")
+            egui::Window::new("")
                 .resizable(false)
                 .collapsible(false)
                 .title_bar(false)
+                .movable(true)
                 .fixed_pos(egui::pos2(20.0, 20.0))
                 .frame(
                     egui::Frame::window(&egui::Style::default())
-                        // .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 230))
+                        .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 250))
                         .rounding(12.0),
                 )
                 .show(ctx, |ui| {
-                    if ui.add(egui::Button::new("⚙️").frame(false)).clicked() {
-                        self.show_settings = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(GEAR_ICON).font(FontId::proportional(18.0)),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            println!("Show settings - show_settings - {}", self.show_settings); // self.show_settings = !self.show_settings;
+                            if self.show_settings {
+                                self.show_settings = true;
+                            } else {
+                                self.show_settings = true;
+                            }
+                        }
+
+                        // Record button
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if self.is_recording {
+                                        RECORD_ON_ICON
+                                    } else {
+                                        RECORD_OFF_ICON
+                                    })
+                                    .font(FontId::proportional(18.0))
+                                    .color(
+                                        if self.is_recording {
+                                            egui::Color32::from_rgb(255, 80, 80)
+                                        } else {
+                                            egui::Color32::LIGHT_GRAY
+                                        },
+                                    ),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            if self.is_recording {
+                                self.stop_recording();
+                            } else {
+                                self.start_recording();
+                            }
+                        }
+
+                        // Fullscreen button
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if self.is_fullscreen {
+                                        FULLSCREEN_EXIT_ICON
+                                    } else {
+                                        FULLSCREEN_ICON
+                                    })
+                                    .font(FontId::proportional(18.0)),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.is_fullscreen = !self.is_fullscreen;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                                self.is_fullscreen,
+                            ));
+                        }
+                    });
                 });
         }
 
@@ -436,6 +515,7 @@ impl eframe::App for ScreenCapApp {
                 .resizable(false)
                 .collapsible(false)
                 .title_bar(false)
+                .movable(true)
                 .default_pos(egui::pos2(20.0, 20.0))
                 .frame(
                     egui::Frame::window(&egui::Style::default())
@@ -445,44 +525,75 @@ impl eframe::App for ScreenCapApp {
                         .inner_margin(12.0),
                 )
                 .show(ctx, |ui| {
-                    // Add close button in the top-left corner
+                    // Add close button and controls in the top bar
                     ui.horizontal(|ui| {
                         if ui
                             .add(
-                                egui::Button::new(egui::RichText::new("⚙️").size(18.0))
-                                    .frame(false),
+                                egui::Button::new(
+                                    egui::RichText::new(GEAR_ICON).font(FontId::proportional(18.0)),
+                                )
+                                .frame(false),
                             )
                             .clicked()
                         {
+                            println!(
+                                "Show settings - show_settings (SKIPPED) - {}",
+                                self.show_settings
+                            );
+
                             self.show_settings = false;
                         }
-                    });
 
-                    ui.add_space(8.0);
-
-                    // Full screen button with modern style
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(if self.is_fullscreen {
-                                    "Exit Fullscreen"
-                                } else {
-                                    "Full Screen"
-                                })
-                                .size(14.0)
-                                .color(egui::Color32::WHITE),
+                        // Record button
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if self.is_recording {
+                                        RECORD_ON_ICON
+                                    } else {
+                                        RECORD_OFF_ICON
+                                    })
+                                    .font(FontId::proportional(18.0))
+                                    .color(
+                                        if self.is_recording {
+                                            egui::Color32::from_rgb(255, 80, 80)
+                                        } else {
+                                            egui::Color32::LIGHT_GRAY
+                                        },
+                                    ),
+                                )
+                                .frame(false),
                             )
-                            .min_size(egui::vec2(ui.available_width(), 36.0))
-                            .fill(egui::Color32::from_rgb(60, 60, 180))
-                            .rounding(8.0),
-                        )
-                        .clicked()
-                    {
-                        self.is_fullscreen = !self.is_fullscreen;
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
-                            self.is_fullscreen,
-                        ));
-                    }
+                            .clicked()
+                        {
+                            if self.is_recording {
+                                self.stop_recording();
+                            } else {
+                                self.start_recording();
+                            }
+                        }
+
+                        // Fullscreen button
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if self.is_fullscreen {
+                                        FULLSCREEN_EXIT_ICON
+                                    } else {
+                                        FULLSCREEN_ICON
+                                    })
+                                    .font(FontId::proportional(18.0)),
+                                )
+                                .frame(false),
+                            )
+                            .clicked()
+                        {
+                            self.is_fullscreen = !self.is_fullscreen;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                                self.is_fullscreen,
+                            ));
+                        }
+                    });
 
                     ui.add_space(12.0);
 
@@ -578,83 +689,38 @@ impl eframe::App for ScreenCapApp {
                     ui.add_space(16.0);
 
                     // Start recording button with modern style
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(if self.is_recording {
-                                    "Stop Recording"
+                    ui.horizontal(|ui| {
+                        ui.add_space((ui.available_width() - 120.0) / 2.0); // Center the button
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(if self.is_recording {
+                                        "Stop Recording"
+                                    } else {
+                                        "Start Recording"
+                                    })
+                                    .size(13.0)
+                                    .color(egui::Color32::WHITE),
+                                )
+                                .min_size(egui::vec2(120.0, 28.0))
+                                .fill(if self.is_recording {
+                                    egui::Color32::from_rgb(220, 60, 60)
                                 } else {
-                                    "Start Recording"
+                                    egui::Color32::from_rgb(240, 80, 80)
                                 })
-                                .size(14.0)
-                                .color(egui::Color32::WHITE),
+                                .rounding(6.0),
                             )
-                            .min_size(egui::vec2(ui.available_width(), 36.0))
-                            .fill(if self.is_recording {
-                                egui::Color32::from_rgb(220, 60, 60)
+                            .clicked()
+                        {
+                            if self.is_recording {
+                                self.stop_recording();
                             } else {
-                                egui::Color32::from_rgb(240, 80, 80)
-                            })
-                            .rounding(8.0),
-                        )
-                        .clicked()
-                    {
-                        if self.is_recording {
-                            self.stop_recording();
-                        } else {
-                            self.start_recording();
+                                self.start_recording();
+                            }
                         }
-                    }
+                    });
 
                     ui.add_space(16.0);
-
-                    // Bottom buttons with tooltips - centered
-                    ui.with_layout(
-                        egui::Layout::top_down_justified(egui::Align::Center),
-                        |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(16.0, 0.0);
-                            ui.horizontal(|ui| {
-                                // Effects button
-                                ui.add_enabled_ui(false, |ui| {
-                                    ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new("✨")
-                                                .size(20.0)
-                                                .color(egui::Color32::from_rgb(140, 140, 140)),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .on_hover_text("Video effects (coming soon)");
-                                });
-
-                                // Notes button
-                                ui.add_enabled_ui(false, |ui| {
-                                    ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new("🗒")
-                                                .size(20.0)
-                                                .color(egui::Color32::from_rgb(140, 140, 140)),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .on_hover_text("Speaker notes (coming soon)");
-                                });
-
-                                // Drawing button
-                                ui.add_enabled_ui(false, |ui| {
-                                    ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new("🎨")
-                                                .size(20.0)
-                                                .color(egui::Color32::from_rgb(140, 140, 140)),
-                                        )
-                                        .frame(false),
-                                    )
-                                    .on_hover_text("Drawing tools (coming soon)");
-                                });
-                            });
-                        },
-                    );
 
                     // Handle source switching outside the UI closure
                     if let Some(idx) = selected_video_src_idx {
@@ -903,4 +969,26 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| Ok(Box::new(ScreenCapApp::new(cc)))),
     )
+}
+
+use egui::FontData;
+use egui::FontDefinitions;
+
+fn add_font(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+
+    // Add FontAwesome
+    fonts.font_data.insert(
+        "FontAwesome".to_owned(),
+        Arc::new(FontData::from_static(include_bytes!("../remixicon.ttf"))),
+    );
+
+    // Insert it into the `proportional` or `monospace` font family
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "FontAwesome".to_owned());
+
+    ctx.set_fonts(fonts);
 }
