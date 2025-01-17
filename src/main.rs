@@ -3,6 +3,7 @@ use core_graphics::display::{CGDisplay, CGDisplayBounds};
 use eframe::egui;
 use egui::epaint::text::layout;
 use egui::FontId;
+use egui::Pos2;
 use egui::ViewportBuilder;
 use gstreamer as gst;
 use gstreamer::glib;
@@ -45,7 +46,11 @@ struct ScreenCapApp {
     current_mic_idx: Option<usize>,
     audio_devices: Vec<MediaDeviceInfo>,
     video_devices: Vec<MediaDeviceInfo>,
+
+    // settings
     show_settings: bool,
+    settings_position: egui::Pos2,
+
     image_size: egui::Vec2,
     update_dimensions_tx: mpsc::Sender<bool>,
     update_audio_tx: mpsc::Sender<bool>,
@@ -123,6 +128,7 @@ impl ScreenCapApp {
                 }
                 let image_size = egui::Vec2::new(width as f32, height as f32);
                 Self {
+                    settings_position: egui::Pos2::new(20.0, 20.0),
                     audio_devices,
                     video_devices: devices,
                     update_audio_tx: mpsc::channel().0,
@@ -167,6 +173,8 @@ impl ScreenCapApp {
                     height: 720,
                 }));
                 Self {
+                    settings_position: egui::Pos2::new(20.0, 20.0),
+
                     audio_devices,
                     video_devices: vec![],
                     texture: None,
@@ -684,12 +692,12 @@ impl eframe::App for ScreenCapApp {
             });
 
         // Settings button in the corner with controls
-        egui::Window::new("")
+        egui::Window::new("settings_collapsed")
             .resizable(false)
             .collapsible(false)
             .title_bar(false)
             .movable(true)
-            .fixed_pos(egui::pos2(20.0, 20.0))
+            .current_pos(self.settings_position)
             .frame(
                 egui::Frame::window(&egui::Style::default())
                     .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 250))
@@ -765,16 +773,25 @@ impl eframe::App for ScreenCapApp {
                         ));
                     }
                 });
+            })
+            .map(|response| {
+                // if response.response.rect {
+                self.settings_position = response.response.rect.left_top();
+                // }
             });
 
         // Expanded settings panel
         if self.show_settings {
-            egui::Window::new("") // Empty title
+            egui::Window::new("expanded_settings") // Empty title
                 .resizable(false)
                 .collapsible(false)
                 .title_bar(false)
                 .movable(true)
-                .fixed_pos(egui::pos2(20.0, 60.0)) // Position below the controls
+                .current_pos(Pos2::new(
+                    self.settings_position.x,
+                    self.settings_position.y + 40.0,
+                ))
+                // .default_pos(egui::pos2(20.0, 60.0)) // Position below the controls
                 .frame(
                     egui::Frame::window(&egui::Style::default())
                         .fill(egui::Color32::from_rgba_premultiplied(20, 20, 30, 250))
