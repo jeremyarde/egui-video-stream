@@ -41,7 +41,6 @@ struct ScreenCapApp {
     is_recording: bool,
     is_mic_enabled: bool,
     pipeline: gst::Pipeline,
-    recording_bin: Option<gst::Element>,
     current_device_idx: Option<usize>,
     current_mic_idx: Option<usize>,
     audio_devices: Vec<MediaDeviceInfo>,
@@ -140,7 +139,6 @@ impl ScreenCapApp {
                     is_mic_enabled: true,
                     current_mic_idx,
                     pipeline,
-                    recording_bin: None,
                     current_device_idx: Some(0),
                     show_settings: false,
                     image_size,
@@ -184,7 +182,6 @@ impl ScreenCapApp {
                     is_mic_enabled: true,
                     current_mic_idx: None,
                     pipeline: dummy_pipeline.downcast::<gst::Pipeline>().unwrap(),
-                    recording_bin: None,
                     current_device_idx: Some(0),
                     show_settings: false,
                     image_size: egui::Vec2::new(1280.0, 720.0),
@@ -365,20 +362,63 @@ impl ScreenCapApp {
     }
 
     fn stop_recording(&mut self) {
-        if let Some((main_video, pip_video, _)) = self.recording_files.take() {
-            // Stop main recording pipeline
-            if let Some(pipeline) = self.recording_pipeline.take() {
-                let _ = pipeline.set_state(gst::State::Null);
-                println!("Main recording saved to: {}", main_video);
+        self.is_recording = false;
+
+        if let Some((main_video, pip_video, final_file)) = self.recording_files.take() {
+            // Stop recording pipelines first
+            if let Some(recording_pipeline) = self.recording_pipeline.take() {
+                let _ = recording_pipeline.set_state(gst::State::Null);
+            }
+            if let Some(pip_pipeline) = self.pip_pipeline.take() {
+                let _ = pip_pipeline.set_state(gst::State::Null);
             }
 
-            // Stop PiP recording pipeline if it exists
-            if let Some(pipeline) = self.pip_pipeline.take() {
-                let _ = pipeline.set_state(gst::State::Null);
-                println!("PiP recording saved to: {}", pip_video);
+            // If PiP was enabled, merge the videos using FFmpeg
+            if self.show_pip {
+                // combine the videos, and output to a new file
+                //                 let compositor_pipeline = gst::parse::launch(&format!(
+                //                     "
+                // compositor name=comp sink_1::xpos=100 sink_1::ypos=50 ! videoconvert ! filesink location={} \
+                // filesrc location={} ! decodebin ! videoconvert ! video/x-raw,format=RGBA ! queue ! comp. \
+                // filesrc location={} ! decodebin ! videoconvert ! video/x-raw,format=RGBA ! queue ! comp.sink_1 \
+                // ",
+                //                     final_file.as_str(),
+                //                     main_video.as_str(),
+                //                     pip_video.as_str()
+                //                 ))
+                //                 .unwrap();
+
+                //                 compositor_pipeline.set_state(gst::State::Playing).unwrap();
+                //                 std::thread::sleep(std::time::Duration::from_secs(10));
+                //                 compositor_pipeline.set_state(gst::State::Null).unwrap();
+                //                 println!("Compositor pipeline finished");
+                //                 // let _ = std::fs::rename(main_video, final_file);
+
+                let status = std::process::Command::new("ffmpeg")
+                    .args([
+                        "-i",
+                        &main_video,
+                        "-i",
+                        &pip_video,
+                        "-filter_complex",
+                        "[0:v][1:v]overlay=x=20:y=20",
+                        "-c:v",
+                        "libx264",
+                        &final_file,
+                    ])
+                    .status()
+                    .expect("Failed to execute ffmpeg");
+
+                if status.success() {
+                    // Clean up temp files
+                    let _ = std::fs::remove_file(main_video);
+                    let _ = std::fs::remove_file(pip_video);
+                }
+            } else {
+                // If no PiP, just rename main video to final file
+                let _ = std::fs::rename(main_video, final_file);
             }
         }
-        self.is_recording = false;
     }
 
     pub fn get_current_frame(&self) -> Option<Vec<u8>> {
